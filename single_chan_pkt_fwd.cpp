@@ -78,6 +78,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <fstream>
 
 using namespace std;
 
@@ -153,8 +154,9 @@ vector<Server_t> servers;
 
 // #############################################
 // #############################################
-
+// COMMON & LORA REGISTERS 
 #define REG_FIFO                    0x00
+#define REG_PA_CONFIG				0x09
 #define REG_FIFO_ADDR_PTR           0x0D
 #define REG_FIFO_TX_BASE_AD         0x0E
 #define REG_FIFO_RX_BASE_AD         0x0F
@@ -174,14 +176,19 @@ vector<Server_t> servers;
 #define REG_MAX_PAYLOAD_LENGTH      0x23
 #define REG_HOP_PERIOD              0x24
 #define REG_SYNC_WORD               0x39
-#define REG_VERSION                 0x42
+#define REG_VERSION	                0x42
+
+//FSK REGISTERS
+#define REG_FSK_RX_CONFIG			0x0D
+#define REG_FSK_RSSI_CONFIG			0x0E
 
 #define SX72_MODE_RX_CONTINUOS      0x85
 #define SX72_MODE_TX                0x83
 #define SX72_MODE_SLEEP             0x80
 #define SX72_MODE_STANDBY           0x81
-
-
+#define SX72_LONG_RANGE_ON          0x80
+#define SX72_LONG_RANGE_OFF         0x7F
+#define SX72_LONG_RANGE_OFF_SLEEP   0x7E
 #define PAYLOAD_LENGTH              0x40
 
 // LOW NOISE AMPLIFIER
@@ -225,6 +232,13 @@ vector<Server_t> servers;
 
 #define TX_BUFF_SIZE    2048
 #define STATUS_SIZE     1024
+
+//RX CONFIG SETTINGS
+#define AGC_AFC_PREAMBLE_DETECT 0x1E
+#define AGC_ON					0x08
+//RSSI COMPENSATION REG SETTINGS
+#define RSSI_DEF_0_OFFSET		0x02
+#define RSSI_NON_DEF_OFFSET		0x80
 
 void LoadConfiguration(string filename);
 void PrintConfiguration();
@@ -374,6 +388,13 @@ void SetupLoRa()
       Die("Unrecognized transceiver");
     }
   }
+  
+  //Changing FSK registers
+  auto opModeRegVal = ReadRegister(REG_OPMODE); 
+  printf("opModeRegVal = 0x%02X\n",opModeRegVal);
+  opModeRegVal &= SX72_LONG_RANGE_OFF_SLEEP ;
+  WriteRegister(REG_OPMODE,opModeRegVal); 	//going to FSK mode
+  WriteRegister(REG_FSK_RX_CONFIG, AGC_ON); //ACG ON
 
   WriteRegister(REG_OPMODE, SX72_MODE_SLEEP);
 
@@ -383,7 +404,7 @@ void SetupLoRa()
   WriteRegister(REG_FRF_MID, (uint8_t)((frf >> 8) & 0xFF));
   WriteRegister(REG_FRF_LSB, (uint8_t)((frf >> 0) & 0xFF));
   printf("setting Frf = %llu\n",frf);
-  WriteRegister(REG_SYNC_WORD, 0x34); // LoRaWAN public sync word
+  //WriteRegister(REG_SYNC_WORD, 0x34); // LoRaWAN public sync word
 
   if (sx1272) {
     if (sf == SF11 || sf == SF12) {
@@ -399,21 +420,30 @@ void SetupLoRa()
       WriteRegister(REG_MODEM_CONFIG3, 0x04);
     }
     WriteRegister(REG_MODEM_CONFIG, (GetBandwidthSetting() << 4) | (codingRateRegSet << 1));
-    WriteRegister(REG_MODEM_CONFIG2, (sf << 4) | 0x04);
+    WriteRegister(REG_MODEM_CONFIG2, (sf << 4) | 0x04); // CRC calculation ON 0x04, OFF 0x00
   }
 
   if (sf == SF10 || sf == SF11 || sf == SF12) {
     WriteRegister(REG_SYMB_TIMEOUT_LSB, 0x05);
   } else {
-    WriteRegister(REG_SYMB_TIMEOUT_LSB, 0x08);
+    WriteRegister(REG_SYMB_TIMEOUT_LSB, 0x64); //symbol timeout using def, previous setting 0x08
   }
   WriteRegister(REG_MAX_PAYLOAD_LENGTH, 0x80);
   WriteRegister(REG_PAYLOAD_LENGTH, PAYLOAD_LENGTH);
   WriteRegister(REG_HOP_PERIOD, 0x00); //MK: Changed hop period from 0xFF to 0x00 turinng the frequncy hopping off
-  WriteRegister(REG_FIFO_ADDR_PTR, ReadRegister(REG_FIFO_RX_BASE_AD));
+  
+  //WriteRegister(REG_FIFO_ADDR_PTR, ReadRegister(REG_FIFO_RX_BASE_AD)); //MK: may not be necessary the Arduino API does not do this
 
+  //Setting output power to +17 dBm (defualt is +13.2 dBM)
+  WriteRegister(REG_PA_CONFIG, 0x8F);
+  
+  // max lna gain
+  WriteRegister(REG_LNA, LNA_MAX_GAIN);
+  
+  //Zero the FIFO Tx Base Addr
+  WriteRegister(REG_FIFO_TX_BASE_AD, 0x00u);
+  
   // Set Continous Receive Mode
-  WriteRegister(REG_LNA, LNA_MAX_GAIN);  // max lna gain
   WriteRegister(REG_OPMODE, SX72_MODE_RX_CONTINUOS);
 }
 
@@ -666,7 +696,48 @@ bool Receivepacket()
   return ret;
 }
 
-int main()
+void wirteConfigToFile(ofstream &file)
+{
+	file << "RegAdress; Value" << endl;
+	for(int i = 0; i < 128; ++i)
+	{
+		unsigned int regVal = ReadRegister(i);
+		file << "0x" << uppercase << hex << i << ";0x" << regVal << endl;
+	}
+}
+
+void dumpSx127xRegisters()
+{
+	ofstream outputFile;
+	auto opModeBackupVal = ReadRegister(REG_OPMODE);
+	printf("Dumping registers and stroing op-mode reg setting: 0X%02x.\n", opModeBackupVal);
+	
+	WriteRegister(REG_OPMODE, SX72_MODE_SLEEP);
+	
+	for(uint8_t i = 0u; i < 2u; ++i)
+	{
+		auto currOpModeVal = ReadRegister(REG_OPMODE);
+		if(i == 0u)
+		{
+			outputFile.open("LoraModeRPI2.csv");
+			currOpModeVal |= SX72_LONG_RANGE_ON;
+		}
+		else
+		{
+			outputFile.open("FskModeRPI2.csv");
+			currOpModeVal &= SX72_LONG_RANGE_OFF;
+		}
+		
+		WriteRegister(REG_OPMODE, currOpModeVal);
+		wirteConfigToFile(outputFile);
+		outputFile.close();	
+	}
+
+	WriteRegister(REG_OPMODE, opModeBackupVal);
+	printf("Reg dumping over check generted files...\n");
+}
+
+int main(int argc, char** argv)
 {
   struct timeval nowtime;
   uint32_t lasttime;
@@ -724,6 +795,11 @@ int main()
   printf("Listening at Bw = %u, SF%i on Channel %u, Freq = %.6lf Mhz.\n", bw, sf, freqChannelID, (double)freq/1000000);
   printf("-----------------------------------\n");
 
+  //Dumping registers
+  if(argc > 1 && !strcmp(argv[1], "-d"))
+  {
+	dumpSx127xRegisters();
+  }
   while(1) {
 
     // Packet received ?
